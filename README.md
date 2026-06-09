@@ -1,11 +1,11 @@
 # onr_handeye (minimal)
 
 Minimal ROS2 Python package for collecting paired samples:
-- AprilTag pose in camera frame (`cam_T_tag`)
+- ChArUco board pose in camera frame (`cam_T_tag`, kept as the JSON field name for compatibility)
 - Robot tool pose in base frame (`base_T_tool`)
 
-Then solve `base_T_cam` with a simple rigid assumption:
-`base_T_cam = base_T_tool * tool_T_tag * inv(cam_T_tag)`.
+Then solve `base_T_cam` with OpenCV `cv2.calibrateHandEye` using the rigid target assumption:
+`base_T_tool * tool_T_tag = base_T_cam * cam_T_tag`.
 
 ## Quick Start (4 steps)
 
@@ -28,12 +28,12 @@ ros2 run onr_handeye solve_base_camera \
 ros2 run onr_handeye check_projection
 ```
 
-## 1) Install dependency
+## 1) Install dependencies
 
-`pupil_apriltags`, `pytransform3d`, and `scipy` are Python dependencies:
+OpenCV with `aruco`, `pytransform3d`, and `scipy` are Python dependencies:
 
 ```bash
-pip install pupil-apriltags pytransform3d scipy
+pip install opencv-contrib-python pytransform3d scipy
 ```
 
 ## 2) Build
@@ -51,15 +51,27 @@ ros2 launch onr_handeye collect_handeye.launch.py
 ```
 
 Notes:
-- Collector now does **not** apply tool-tag offset parameters. Keep sampling raw `base_T_tool` + `cam_T_tag` pairs.
-- Tool/tag rigid transform handling is done at solve/check stage.
-- Collector no longer publishes RViz prediction TF (`tag_meas/tag_pred`).
+- Collector detects a ChArUco board and saves raw `base_T_tool` + `cam_T_tag` pairs.
+- `cam_T_tag` means camera-to-calibration-target transform; the field name is kept for existing solve/check compatibility.
+- Tool/target rigid transform handling is done at solve/check stage.
+- Collector does not publish RViz prediction TF (`tag_meas/tag_pred`).
 - RViz visualization of current robot pose in camera frame is provided by `check_projection` (see section 6).
 
 Current default topics in node params are:
 - image: `/zed/zed_node/left/color/rect/image`
 - camera_info: `/zed/zed_node/left/color/rect/camera_info`
 - robot_pose (PoseStamped): `/right/manip/measured/tool_int_pose`
+
+Current default ChArUco target parameters are:
+- `aruco_dictionary`: `DICT_6X6_250`
+- `charuco_squares_x`: `8`
+- `charuco_squares_y`: `12`
+- `charuco_square_length_m`: `0.01`
+- `charuco_marker_length_m`: `0.007`
+- `charuco_legacy_pattern`: `true`
+- `min_charuco_corners`: `4`
+
+If ArUco markers are detected but ChArUco corners stay at zero, verify dictionary, board dimensions, and `charuco_legacy_pattern`.
 
 ## 4) Capture and save samples
 
@@ -72,9 +84,10 @@ ros2 run rqt_image_view rqt_image_view
 Then select topic `/onr_handeye/debug_image`.
 
 Overlay meanings:
-- Green box + `id=...`: tag detected.
-- Red text `AprilTag NOT detected`: no tag in current frame.
-- Red text `tag id X not found`: detection exists but not your target id.
+- `ChArUco pose OK: markers=N, corners=M`: board pose is being estimated and axes are drawn.
+- `ChArUco markers NOT detected`: no ArUco markers in current frame.
+- `ArUco=N, ChArUco=M need>=K`: markers are visible, but not enough ChArUco corners for pose.
+- `ChArUco pose failed`: enough corners were found, but OpenCV pose estimation failed.
 
 At each robot pose (steady), call:
 
@@ -139,13 +152,13 @@ ros2 run onr_handeye auto_collect_samples --ros-args \
 
 ## 5) Solve base-camera transform
 
-If tag frame equals tool frame, use identity `tool_T_tag`:
+If target frame equals tool frame, use identity `tool_T_tag`:
 
 ```bash
 ros2 run onr_handeye solve_base_camera --samples handeye_samples.json
 ```
 
-If tag is offset from tool, pass row-major 4x4 `tool_T_tag`:
+If the ChArUco target frame is offset from tool, pass row-major 4x4 `tool_T_tag`:
 
 ```bash
 ros2 run onr_handeye solve_base_camera --samples handeye_samples.json \
@@ -154,10 +167,10 @@ ros2 run onr_handeye solve_base_camera --samples handeye_samples.json \
 
 Result is saved to `base_T_cam_result.json`.
 
-You can tune orientation-vs-translation weighting in error reporting/output metadata:
+Choose the OpenCV hand-eye method if desired:
 
 ```bash
-ros2 run onr_handeye solve_base_camera --samples handeye_samples.json --rot-weight 0.2
+ros2 run onr_handeye solve_base_camera --samples handeye_samples.json --handeye-method PARK
 ```
 
 ### Optional parameters for `solve_base_camera`
@@ -170,10 +183,9 @@ Most useful options:
 - `--samples`: input sample JSON.
 - `--out`: output result JSON path. Default `base_T_cam_result.json`.
 - `--tool-t-tag`: 4x4 row-major `tool_T_tag`.
-- `--tool-tag-offset-mm`: extra translation (mm) from tool origin to tag origin.
+- `--tool-tag-offset-mm`: extra translation (mm) from tool origin to target origin.
 - `--tool-tag-axis`: axis for `--tool-tag-offset-mm` (`x|y|z|-x|-y|-z`).
-- `--seed`, `--multistart`, `--rot-weight`: kept for compatibility and metadata.
-- `--prune-outliers`: accepted but currently ignored in notebook-style averaging mode.
+- `--handeye-method`: OpenCV method (`TSAI`, `PARK`, `HORAUD`, `ANDREFF`, `DANIILIDIS`). Default `PARK`.
 
 Example with offset applied only at solve stage:
 
@@ -189,12 +201,12 @@ ros2 run onr_handeye solve_base_camera \
 ## 6) Projection check (recommended)
 
 `check_projection` now supports two methods:
-- Method A: offline residual statistics (predicted tag vs measured tag on recorded samples).
+- Method A: offline residual statistics (predicted target vs measured target on recorded samples).
 - Method B: live RViz TF for current robot pose in camera frame.
 
 ### Method A: offline residual statistics
 
-After solve, validate predicted vs measured tag poses:
+After solve, validate predicted vs measured target poses:
 
 ```bash
 ros2 run onr_handeye check_projection
@@ -241,7 +253,7 @@ Notes for live mode:
 
 ## Notes
 
-- This solver now follows notebook-style averaging from per-sample `cam_T_base` estimates, then inverts to `base_T_cam`.
-- This minimal implementation assumes the AprilTag is rigidly mounted on the robot tool.
+- The solver uses `cv2.calibrateHandEye`.
+- This minimal implementation assumes the ChArUco board is rigidly mounted on the robot tool.
 - If your setup is eye-in-hand or fixed-world target workflow, this collector is still useful, but the solver should be swapped to the corresponding calibration model.
 - Image conversion avoids `cv_bridge` so it is robust with NumPy 2 environments.
