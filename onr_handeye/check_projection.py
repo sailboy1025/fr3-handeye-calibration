@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation as R
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Back-project solved base_T_cam to camera frame and compare predicted vs measured cam_T_tag.'
+        description='Back-project solved base_T_cam to camera frame and compare predicted vs measured cam_T_target.'
     )
     parser.add_argument(
         '--samples',
@@ -33,19 +33,19 @@ def parse_args() -> argparse.Namespace:
         ],
         metavar=('m00', 'm01', 'm02', 'm03', 'm10', 'm11', 'm12', 'm13',
                  'm20', 'm21', 'm22', 'm23', 'm30', 'm31', 'm32', 'm33'),
-        help='4x4 tool_T_tag row-major matrix. Default is identity.',
+        help='4x4 tool_T_tag/tool_T_target row-major matrix. Default is identity.',
     )
     parser.add_argument(
         '--tool-tag-offset-mm',
         type=float,
         default=0.0,
-        help='Extra fixed translation from tool origin to tag origin in millimeters.',
+        help='Extra fixed translation from tool origin to calibration target origin in millimeters.',
     )
     parser.add_argument(
         '--tool-tag-axis',
         choices=['x', 'y', 'z', '-x', '-y', '-z'],
         default='z',
-        help='Axis of the extra tool->tag translation offset.',
+        help='Axis of the extra tool->target translation offset.',
     )
     parser.add_argument('--top-k', type=int, default=5, help='Print top-k worst samples by combined score.')
     parser.add_argument('--print-cam-t-tool', action='store_true', help='Print cam_T_tool matrix per sample.')
