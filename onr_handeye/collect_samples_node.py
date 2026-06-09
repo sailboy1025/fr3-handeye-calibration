@@ -9,15 +9,9 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 import pytransform3d.transformations as pt
-from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from std_srvs.srv import Trigger
 from message_filters import Subscriber, ApproximateTimeSynchronizer
-
-try:
-    from pupil_apriltags import Detector
-except ImportError:  # pragma: no cover - runtime dependency
-    Detector = None
 
 
 class HandEyeCollector(Node):
@@ -27,9 +21,13 @@ class HandEyeCollector(Node):
         self.declare_parameter('image_topic', '/zed/zed_node/left/color/rect/image')
         self.declare_parameter('camera_info_topic', '/zed/zed_node/left/color/rect/camera_info')
         self.declare_parameter('robot_pose_topic', '/right/manip/measured/tool_int_pose')
-        self.declare_parameter('tag_size_m', 0.08)
-        self.declare_parameter('tag_family', 'tag36h11')
-        self.declare_parameter('target_tag_id', -1)
+        self.declare_parameter('aruco_dictionary', 'DICT_6X6_250')
+        self.declare_parameter('charuco_squares_x', 8)
+        self.declare_parameter('charuco_squares_y', 12)
+        self.declare_parameter('charuco_square_length_m', 0.01)
+        self.declare_parameter('charuco_marker_length_m', 0.007)
+        self.declare_parameter('charuco_legacy_pattern', True)
+        self.declare_parameter('min_charuco_corners', 4)
         self.declare_parameter('samples_file', 'handeye_samples.json')
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('debug_image_topic', '/onr_handeye/debug_image')
@@ -37,9 +35,7 @@ class HandEyeCollector(Node):
         self.declare_parameter('online_solve_enabled', True)
         self.declare_parameter('online_solve_min_samples', 8)
         self.declare_parameter('online_solve_every_n', 1)
-        self.declare_parameter('online_rot_weight', 0.2)
-        self.declare_parameter('online_multistart', 6)
-        self.declare_parameter('online_seed', 42)
+        self.declare_parameter('handeye_method', 'PARK')
         self.declare_parameter(
             'tool_t_tag',
             [
@@ -54,9 +50,13 @@ class HandEyeCollector(Node):
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
         robot_pose_topic = self.get_parameter('robot_pose_topic').get_parameter_value().string_value
-        self.tag_size_m = self.get_parameter('tag_size_m').get_parameter_value().double_value
-        self.target_tag_id = self.get_parameter('target_tag_id').get_parameter_value().integer_value
-        tag_family = self.get_parameter('tag_family').get_parameter_value().string_value
+        dictionary_name = self.get_parameter('aruco_dictionary').get_parameter_value().string_value
+        self.charuco_squares_x = int(self.get_parameter('charuco_squares_x').get_parameter_value().integer_value)
+        self.charuco_squares_y = int(self.get_parameter('charuco_squares_y').get_parameter_value().integer_value)
+        self.charuco_square_length_m = self.get_parameter('charuco_square_length_m').get_parameter_value().double_value
+        self.charuco_marker_length_m = self.get_parameter('charuco_marker_length_m').get_parameter_value().double_value
+        self.charuco_legacy_pattern = self.get_parameter('charuco_legacy_pattern').get_parameter_value().bool_value
+        self.min_charuco_corners = int(self.get_parameter('min_charuco_corners').get_parameter_value().integer_value)
         self.samples_file = self.get_parameter('samples_file').get_parameter_value().string_value
         self.publish_debug_image = self.get_parameter('publish_debug_image').get_parameter_value().bool_value
         self.debug_image_topic = self.get_parameter('debug_image_topic').get_parameter_value().string_value
@@ -64,23 +64,28 @@ class HandEyeCollector(Node):
         self.online_solve_enabled = self.get_parameter('online_solve_enabled').get_parameter_value().bool_value
         self.online_solve_min_samples = int(self.get_parameter('online_solve_min_samples').get_parameter_value().integer_value)
         self.online_solve_every_n = max(1, int(self.get_parameter('online_solve_every_n').get_parameter_value().integer_value))
-        self.online_rot_weight = self.get_parameter('online_rot_weight').get_parameter_value().double_value
-        self.online_multistart = max(1, int(self.get_parameter('online_multistart').get_parameter_value().integer_value))
-        self.online_seed = int(self.get_parameter('online_seed').get_parameter_value().integer_value)
+        self.handeye_method = self.get_parameter('handeye_method').get_parameter_value().string_value.upper()
         tool_t_tag_raw = self.get_parameter('tool_t_tag').value
         self.tool_t_tag = pt.check_transform(np.asarray(tool_t_tag_raw, dtype=float).reshape(4, 4))
 
-        if Detector is None:
-            raise RuntimeError(
-                'Missing dependency pupil_apriltags. Install with: pip install pupil-apriltags'
-            )
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(self._aruco_dictionary_id(dictionary_name))
+        self.charuco_board = cv2.aruco.CharucoBoard(
+            (self.charuco_squares_x, self.charuco_squares_y),
+            float(self.charuco_square_length_m),
+            float(self.charuco_marker_length_m),
+            self.aruco_dict,
+        )
+        if hasattr(self.charuco_board, 'setLegacyPattern'):
+            self.charuco_board.setLegacyPattern(bool(self.charuco_legacy_pattern))
+        self.aruco_params = cv2.aruco.DetectorParameters()
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
-        self.detector = Detector(families=tag_family, nthreads=2, quad_decimate=1.0)
-
-        self.camera_params: Optional[tuple[float, float, float, float]] = None
+        self.camera_matrix: Optional[np.ndarray] = None
+        self.dist_coeffs: Optional[np.ndarray] = None
         self.latest_cam_t_tag: Optional[np.ndarray] = None
         self.latest_base_t_tool: Optional[np.ndarray] = None
-        self.latest_tag_id: Optional[int] = None
+        self.latest_marker_count = 0
+        self.latest_charuco_count = 0
         self.latest_image_frame: str = ''
         self.sample_count = 0
         self.samples: list[dict] = []
@@ -110,24 +115,60 @@ class HandEyeCollector(Node):
         self.get_logger().info(f'listening image: {image_topic}')
         self.get_logger().info(f'listening camera_info: {camera_info_topic}')
         self.get_logger().info(f'listening robot_pose: {robot_pose_topic}')
+        self.get_logger().info(
+            f'ChArUco board: dict={dictionary_name}, squares='
+            f'{self.charuco_squares_x}x{self.charuco_squares_y}, '
+            f'square={self.charuco_square_length_m:.4f}m, '
+            f'marker={self.charuco_marker_length_m:.4f}m, '
+            f'legacy={self.charuco_legacy_pattern}'
+        )
         self.get_logger().info('call /capture_sample when robot is steady at each pose')
         if self.publish_debug_image:
             self.get_logger().info(f'publishing debug image: {self.debug_image_topic}')
-            self.get_logger().info(f'debug axis scale: {self.debug_axis_scale:.2f} (relative to tag_size_m)')
+            self.get_logger().info(f'debug axis scale: {self.debug_axis_scale:.2f} (relative to square length)')
         if self.online_solve_enabled:
             self.get_logger().info(
                 f'online solve enabled: min_samples={self.online_solve_min_samples}, '
-                f'every_n={self.online_solve_every_n}, multistart={self.online_multistart}'
+                f'every_n={self.online_solve_every_n}, method={self.handeye_method}'
             )
 
+    @staticmethod
+    def _aruco_dictionary_id(name: str) -> int:
+        dictionary_id = getattr(cv2.aruco, str(name), None)
+        if dictionary_id is None:
+            valid = sorted(k for k in dir(cv2.aruco) if k.startswith('DICT_'))
+            raise ValueError(f'Unknown ArUco dictionary "{name}". Valid examples: {valid[:8]} ...')
+        return int(dictionary_id)
+
+    @staticmethod
+    def _handeye_method_id(name: str) -> int:
+        mapping = {
+            'TSAI': cv2.CALIB_HAND_EYE_TSAI,
+            'PARK': cv2.CALIB_HAND_EYE_PARK,
+            'HORAUD': cv2.CALIB_HAND_EYE_HORAUD,
+            'ANDREFF': cv2.CALIB_HAND_EYE_ANDREFF,
+            'DANIILIDIS': cv2.CALIB_HAND_EYE_DANIILIDIS,
+        }
+        method = str(name).upper()
+        if method not in mapping:
+            raise ValueError(f'Unknown handeye_method "{name}". Valid: {sorted(mapping)}')
+        return mapping[method]
+
     def _camera_info_cb(self, msg: CameraInfo) -> None:
-        if self.camera_params is not None:
+        if self.camera_matrix is not None:
             return
         fx = msg.k[0]
         fy = msg.k[4]
         cx = msg.k[2]
         cy = msg.k[5]
-        self.camera_params = (float(fx), float(fy), float(cx), float(cy))
+        self.camera_matrix = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        if len(msg.d) > 0:
+            self.dist_coeffs = np.asarray(msg.d, dtype=np.float64).reshape(-1, 1)
+        else:
+            self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
         self.get_logger().info(f'camera intrinsics ready: fx={fx:.2f}, fy={fy:.2f}')
 
     def _image_pose_cb(self, img_msg: Image, pose_msg: PoseStamped) -> None:
@@ -145,7 +186,7 @@ class HandEyeCollector(Node):
             pose_msg.pose.orientation.w
         )
 
-        if self.camera_params is None:
+        if self.camera_matrix is None or self.dist_coeffs is None:
             if self.publish_debug_image:
                 debug_img = self._image_to_bgr(img_msg)
                 if debug_img is not None:
@@ -162,45 +203,82 @@ class HandEyeCollector(Node):
                 self._publish_debug_image(debug_img, img_msg)
             return
 
-        detections = self.detector.detect(
+        marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(
             gray,
-            estimate_tag_pose=True,
-            camera_params=self.camera_params,
-            tag_size=float(self.tag_size_m),
+            self.aruco_dict,
+            parameters=self.aruco_params,
         )
-        if not detections:
+        self.latest_cam_t_tag = None
+        self.latest_marker_count = 0 if marker_ids is None else len(marker_ids)
+        self.latest_charuco_count = 0
+
+        if marker_ids is None or len(marker_ids) == 0:
             if debug_img is not None:
-                self._draw_status(debug_img, 'AprilTag NOT detected', (0, 0, 255))
+                self._draw_status(debug_img, 'ChArUco markers NOT detected', (0, 0, 255))
                 self._publish_debug_image(debug_img, img_msg)
             return
 
-        selected = None
-        if self.target_tag_id >= 0:
-            for det in detections:
-                if int(det.tag_id) == self.target_tag_id:
-                    selected = det
-                    break
-        else:
-            selected = detections[0]
-
-        if selected is None:
-            if debug_img is not None:
-                self._draw_status(debug_img, f'tag id {self.target_tag_id} not found', (0, 0, 255))
-                self._publish_debug_image(debug_img, img_msg)
-            return
-
-        cam_t_tag = pt.transform_from(
-            np.asarray(selected.pose_R, dtype=float),
-            np.asarray(selected.pose_t, dtype=float).reshape(3),
+        count, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+            marker_corners,
+            marker_ids,
+            gray,
+            self.charuco_board,
+            self.camera_matrix,
+            self.dist_coeffs,
         )
-
-        self.latest_cam_t_tag = cam_t_tag
-        self.latest_tag_id = int(selected.tag_id)
+        self.latest_charuco_count = int(count)
 
         if debug_img is not None:
-            self._draw_detection(debug_img, selected)
-            self._draw_tag_axes(debug_img, selected)
-            self._draw_status(debug_img, f'detected tag id={int(selected.tag_id)}', (0, 255, 0))
+            cv2.aruco.drawDetectedMarkers(debug_img, marker_corners, marker_ids)
+
+        if charuco_ids is None or count < self.min_charuco_corners:
+            if debug_img is not None:
+                self._draw_status(
+                    debug_img,
+                    f'ArUco={self.latest_marker_count}, ChArUco={self.latest_charuco_count} need>={self.min_charuco_corners}',
+                    (0, 0, 255),
+                )
+                self._publish_debug_image(debug_img, img_msg)
+            return
+
+        if debug_img is not None:
+            cv2.aruco.drawDetectedCornersCharuco(debug_img, charuco_corners, charuco_ids)
+
+        ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
+            charuco_corners,
+            charuco_ids,
+            self.charuco_board,
+            self.camera_matrix,
+            self.dist_coeffs,
+            None,
+            None,
+        )
+        if not ok:
+            if debug_img is not None:
+                self._draw_status(
+                    debug_img,
+                    f'ChArUco pose failed: markers={self.latest_marker_count}, corners={self.latest_charuco_count}',
+                    (0, 0, 255),
+                )
+                self._publish_debug_image(debug_img, img_msg)
+            return
+
+        rot, _ = cv2.Rodrigues(rvec)
+        self.latest_cam_t_tag = pt.transform_from(
+            np.asarray(rot, dtype=float),
+            np.asarray(tvec, dtype=float).reshape(3),
+        )
+
+        if debug_img is not None:
+            cv2.drawFrameAxes(
+                debug_img,
+                self.camera_matrix,
+                self.dist_coeffs,
+                rvec,
+                tvec,
+                length=max(float(self.charuco_square_length_m) * float(self.debug_axis_scale), 1e-4),
+            )
+            self._draw_status(debug_img, f'ChArUco pose OK: markers={self.latest_marker_count}, corners={self.latest_charuco_count}', (0, 255, 0))
             self._publish_debug_image(debug_img, img_msg)
 
     def _capture_sample_cb(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
@@ -211,12 +289,17 @@ class HandEyeCollector(Node):
 
         if self.latest_cam_t_tag is None:
             response.success = False
-            response.message = 'No AprilTag pose detected yet.'
+            response.message = (
+                'No ChArUco board pose detected yet '
+                f'(markers={self.latest_marker_count}, corners={self.latest_charuco_count}).'
+            )
             return response
 
         sample = {
             'index': self.sample_count,
-            'tag_id': int(self.latest_tag_id if self.latest_tag_id is not None else -1),
+            'target_type': 'charuco_board',
+            'marker_count': int(self.latest_marker_count),
+            'charuco_corner_count': int(self.latest_charuco_count),
             'base_T_tool': self.latest_base_t_tool.reshape(-1).tolist(),
             'cam_T_tag': self.latest_cam_t_tag.reshape(-1).tolist(),
         }
@@ -238,8 +321,13 @@ class HandEyeCollector(Node):
         out_path = os.path.expanduser(self.samples_file)
         payload = {
             'meta': {
-                'tag_size_m': float(self.tag_size_m),
-                'target_tag_id': int(self.target_tag_id),
+                'target_type': 'charuco_board',
+                'aruco_dictionary': self.get_parameter('aruco_dictionary').get_parameter_value().string_value,
+                'charuco_squares_x': int(self.charuco_squares_x),
+                'charuco_squares_y': int(self.charuco_squares_y),
+                'charuco_square_length_m': float(self.charuco_square_length_m),
+                'charuco_marker_length_m': float(self.charuco_marker_length_m),
+                'charuco_legacy_pattern': bool(self.charuco_legacy_pattern),
                 'num_samples': len(self.samples),
             },
             'samples': self.samples,
@@ -319,64 +407,6 @@ class HandEyeCollector(Node):
 
         return None
 
-    def _draw_detection(self, image_bgr: np.ndarray, det: object) -> None:
-        corners = np.asarray(det.corners, dtype=float).reshape(-1, 2).astype(int)
-        if corners.shape[0] >= 4:
-            for i in range(4):
-                p0 = tuple(corners[i])
-                p1 = tuple(corners[(i + 1) % 4])
-                cv2.line(image_bgr, p0, p1, (0, 255, 0), 2)
-        center = np.asarray(det.center, dtype=float).reshape(2).astype(int)
-        cv2.circle(image_bgr, tuple(center), 4, (0, 255, 255), -1)
-        cv2.putText(
-            image_bgr,
-            f'id={int(det.tag_id)}',
-            (int(center[0]) + 8, int(center[1]) - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-    def _draw_tag_axes(self, image_bgr: np.ndarray, det: object) -> None:
-        if self.camera_params is None:
-            return
-
-        axis_len = max(float(self.tag_size_m) * float(self.debug_axis_scale), 1e-4)
-        obj_pts = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [axis_len, 0.0, 0.0],
-                [0.0, axis_len, 0.0],
-                [0.0, 0.0, axis_len],
-            ],
-            dtype=np.float32,
-        )
-
-        fx, fy, cx, cy = self.camera_params
-        cam_k = np.array(
-            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
-            dtype=np.float64,
-        )
-
-        rvec, _ = cv2.Rodrigues(np.asarray(det.pose_R, dtype=np.float64))
-        tvec = np.asarray(det.pose_t, dtype=np.float64).reshape(3, 1)
-        img_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, cam_k, np.zeros((4, 1), dtype=np.float64))
-        img_pts = img_pts.reshape(-1, 2).astype(int)
-
-        o = tuple(img_pts[0])
-        px = tuple(img_pts[1])
-        py = tuple(img_pts[2])
-        pz = tuple(img_pts[3])
-
-        cv2.line(image_bgr, o, px, (0, 0, 255), 2)
-        cv2.line(image_bgr, o, py, (0, 255, 0), 2)
-        cv2.line(image_bgr, o, pz, (255, 0, 0), 2)
-        cv2.putText(image_bgr, 'X', (px[0] + 4, px[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        cv2.putText(image_bgr, 'Y', (py[0] + 4, py[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(image_bgr, 'Z', (pz[0] + 4, pz[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
-
     def _draw_status(self, image_bgr: np.ndarray, text: str, color_bgr: tuple[int, int, int]) -> None:
         cv2.rectangle(image_bgr, (8, 8), (520, 40), (0, 0, 0), -1)
         cv2.putText(
@@ -419,38 +449,6 @@ class HandEyeCollector(Node):
     def _se3_from_list(self, values: list[float]) -> np.ndarray:
         return np.asarray(values, dtype=float).reshape(4, 4)
 
-    def _se3_to_params(self, t_base_cam: np.ndarray) -> np.ndarray:
-        t = np.asarray(t_base_cam[:3, 3], dtype=float)
-        rotvec = R.from_matrix(t_base_cam[:3, :3]).as_rotvec()
-        return np.array([t[0], t[1], t[2], rotvec[0], rotvec[1], rotvec[2]], dtype=float)
-
-    def _params_to_se3(self, x: np.ndarray) -> np.ndarray:
-        rot = R.from_rotvec(np.asarray(x[3:6], dtype=float)).as_matrix()
-        return pt.transform_from(rot, np.asarray(x[:3], dtype=float))
-
-    def _estimate_base_t_cam_from_one(self, sample: dict) -> np.ndarray:
-        base_t_tool = self._se3_from_list(sample['base_T_tool'])
-        cam_t_tag = self._se3_from_list(sample['cam_T_tag'])
-        return pt.concat(pt.concat(base_t_tool, self.tool_t_tag), pt.invert_transform(cam_t_tag))
-
-    def _residual_vector(self, x: np.ndarray) -> np.ndarray:
-        base_t_cam = self._params_to_se3(x)
-        cam_t_base = pt.invert_transform(base_t_cam)
-        residuals: list[float] = []
-
-        for s in self.samples:
-            base_t_tool = self._se3_from_list(s['base_T_tool'])
-            cam_t_tag_meas = self._se3_from_list(s['cam_T_tag'])
-            cam_t_tag_pred = pt.concat(pt.concat(cam_t_base, base_t_tool), self.tool_t_tag)
-
-            t_err = np.asarray(cam_t_tag_pred[:3, 3], dtype=float) - np.asarray(cam_t_tag_meas[:3, 3], dtype=float)
-            rot_delta = pt.concat(pt.invert_transform(cam_t_tag_meas), cam_t_tag_pred)
-            rot_err = R.from_matrix(rot_delta[:3, :3]).as_rotvec()
-            residuals.extend(t_err.tolist())
-            residuals.extend((float(self.online_rot_weight) * rot_err).tolist())
-
-        return np.array(residuals, dtype=float)
-
     def _evaluate_errors(self, base_t_cam: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         trans_err = []
         rot_err_deg = []
@@ -458,37 +456,44 @@ class HandEyeCollector(Node):
         for s in self.samples:
             base_t_tool = self._se3_from_list(s['base_T_tool'])
             cam_t_tag_meas = self._se3_from_list(s['cam_T_tag'])
-            cam_t_tag_pred = pt.concat(pt.concat(cam_t_base, base_t_tool), self.tool_t_tag)
+            cam_t_tag_pred = cam_t_base @ base_t_tool @ self.tool_t_tag
 
             te = np.linalg.norm(np.asarray(cam_t_tag_pred[:3, 3], dtype=float) - np.asarray(cam_t_tag_meas[:3, 3], dtype=float))
-            rot_delta = pt.concat(pt.invert_transform(cam_t_tag_meas), cam_t_tag_pred)
+            rot_delta = pt.invert_transform(cam_t_tag_meas) @ cam_t_tag_pred
             re = R.from_matrix(rot_delta[:3, :3]).as_rotvec()
             trans_err.append(float(te))
             rot_err_deg.append(float(np.linalg.norm(np.rad2deg(re))))
 
         return np.array(trans_err, dtype=float), np.array(rot_err_deg, dtype=float)
 
-    def _build_start_points(self) -> list[np.ndarray]:
-        starts: list[np.ndarray] = []
-        if self.online_base_t_cam is not None:
-            starts.append(self._se3_to_params(self.online_base_t_cam))
+    def _solve_base_t_cam_handeye(self) -> np.ndarray:
+        r_gripper2base = []
+        t_gripper2base = []
+        r_target2cam = []
+        t_target2cam = []
 
-        seed = self._estimate_base_t_cam_from_one(self.samples[0])
-        starts.append(self._se3_to_params(seed))
+        for s in self.samples:
+            base_t_tool = self._se3_from_list(s['base_T_tool'])
+            cam_t_tag = self._se3_from_list(s['cam_T_tag'])
+            base_t_tag = base_t_tool @ self.tool_t_tag
+            tag_t_base = pt.invert_transform(base_t_tag)
 
-        for s in self.samples[1:]:
-            if len(starts) >= self.online_multistart:
-                break
-            starts.append(self._se3_to_params(self._estimate_base_t_cam_from_one(s)))
+            r_gripper2base.append(np.asarray(tag_t_base[:3, :3], dtype=np.float64))
+            t_gripper2base.append(np.asarray(tag_t_base[:3, 3], dtype=np.float64).reshape(3, 1))
+            r_target2cam.append(np.asarray(cam_t_tag[:3, :3], dtype=np.float64))
+            t_target2cam.append(np.asarray(cam_t_tag[:3, 3], dtype=np.float64).reshape(3, 1))
 
-        rng = np.random.default_rng(self.online_seed + len(self.samples))
-        while len(starts) < self.online_multistart:
-            x = starts[0].copy()
-            x[:3] += rng.normal(0.0, 0.03, size=3)
-            x[3:6] += rng.normal(0.0, 0.15, size=3)
-            starts.append(x)
-
-        return starts
+        rot, trans = cv2.calibrateHandEye(
+            r_gripper2base,
+            t_gripper2base,
+            r_target2cam,
+            t_target2cam,
+            method=self._handeye_method_id(self.handeye_method),
+        )
+        return pt.transform_from(
+            np.asarray(rot, dtype=float),
+            np.asarray(trans, dtype=float).reshape(3),
+        )
 
     def _run_online_solve_if_needed(self) -> None:
         if not self.online_solve_enabled:
@@ -502,27 +507,13 @@ class HandEyeCollector(Node):
         if ((n - self.online_solve_min_samples) % self.online_solve_every_n) != 0:
             return
 
-        best = None
-        for x0 in self._build_start_points():
-            opt = least_squares(
-                self._residual_vector,
-                x0,
-                method='trf',
-                loss='huber',
-                f_scale=0.01,
-                max_nfev=300,
-            )
-            if not opt.success:
-                continue
-            if best is None or opt.cost < best.cost:
-                best = opt
-
-        if best is None:
-            self.get_logger().warn('online solve failed for all start points.')
+        try:
+            self.online_base_t_cam = self._solve_base_t_cam_handeye()
+        except cv2.error as exc:
+            self.get_logger().warn(f'online cv2.calibrateHandEye failed: {exc}')
             self.online_metrics_text = f'online n={n} solve failed'
             return
 
-        self.online_base_t_cam = self._params_to_se3(best.x)
         trans_err, rot_err_deg = self._evaluate_errors(self.online_base_t_cam)
         t_mean = float(np.mean(trans_err))
         t_std = float(np.std(trans_err))
@@ -534,7 +525,7 @@ class HandEyeCollector(Node):
             f'r={r_mean:.1f}+-{r_std:.1f}deg'
         )
         self.get_logger().info(
-            f'[online solve] n={n}, cost={float(best.cost):.6f}, '
+            f'[online cv2.calibrateHandEye:{self.handeye_method}] n={n}, '
             f'trans={t_mean:.4f}+-{t_std:.4f} m, rot={r_mean:.2f}+-{r_std:.2f} deg'
         )
 
