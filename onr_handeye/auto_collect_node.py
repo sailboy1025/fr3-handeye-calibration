@@ -23,27 +23,40 @@ class AutoCollector(Node):
         # You can replace command_topic with your real robot command topic.
         self.declare_parameter('robot_pose_topic', '/right/manip/measured/tool_int_pose')
         self.declare_parameter('command_topic', '/righthand/pose')
+        self.declare_parameter('start_position', [
+            0.4484192132949829,
+            0.3618442118167877,
+            0.20653684437274933,
+        ])
+        self.declare_parameter('start_orientation', [
+            -0.3472360339746712,
+            0.6331430428480898,
+            0.5757953789455686,
+            0.383427575413574,
+        ])
         self.declare_parameter('capture_service', '/capture_sample')
         self.declare_parameter('save_service', '/save_samples')
         self.declare_parameter('auto_save_at_end', True)
 
         self.declare_parameter('tick_hz', 100.0)
-        self.declare_parameter('settle_time_sec', 1.5)
+        self.declare_parameter('settle_time_sec', 0.7)
         self.declare_parameter('retry_interval_sec', 0.6)
-        self.declare_parameter('max_capture_retries', 3)
+        self.declare_parameter('max_capture_retries', 2)
         self.declare_parameter('samples_per_pose', 1)
 
         # 30cm range (±15cm), 1cm step
-        translation_vals = [float(x) for x in np.arange(-0.16, 0.16, 0.2)]
+        translation_vals = [float(x) for x in np.arange(-0.20, 0.20, 0.05)]
         self.declare_parameter('translation_offsets_m', translation_vals)
         # 45deg range (±22.5deg), 1deg step
-        rotation_vals = [float(x) for x in np.arange(-22, 23, 2)]
+        rotation_vals = [float(x) for x in np.arange(-30, 30, 10)]
         self.declare_parameter('rotation_offsets_deg', rotation_vals)
         self.declare_parameter('do_translation_sweep', True)
         self.declare_parameter('do_rotation_sweep', True)
 
         robot_pose_topic = self.get_parameter('robot_pose_topic').value
         command_topic = self.get_parameter('command_topic').value
+        self.start_position = np.asarray(self.get_parameter('start_position').value, dtype=float)
+        self.start_orientation = np.asarray(self.get_parameter('start_orientation').value, dtype=float)
         self.capture_service_name = self.get_parameter('capture_service').value
         self.save_service_name = self.get_parameter('save_service').value
         self.auto_save_at_end = bool(self.get_parameter('auto_save_at_end').value)
@@ -168,7 +181,7 @@ class AutoCollector(Node):
         if self.auto_save_at_end and not self.save_client.wait_for_service(timeout_sec=0.0):
             return
 
-        self.base_pose = self.latest_robot_pose
+        self.base_pose = self._make_seed_pose(self.latest_robot_pose.header.frame_id)
         self.targets = self._build_targets(self.base_pose)
 
         self.current_idx = 0
@@ -265,6 +278,30 @@ class AutoCollector(Node):
                 )
 
         return targets
+
+    def _make_seed_pose(self, frame_id: str) -> PoseStamped:
+        msg = PoseStamped()
+        msg.header.frame_id = frame_id
+        msg.pose.position.x = float(self.start_position[0])
+        msg.pose.position.y = float(self.start_position[1])
+        msg.pose.position.z = float(self.start_position[2])
+        msg.pose.orientation.x = float(self.start_orientation[0])
+        msg.pose.orientation.y = float(self.start_orientation[1])
+        msg.pose.orientation.z = float(self.start_orientation[2])
+        msg.pose.orientation.w = float(self.start_orientation[3])
+        return msg
+
+    @staticmethod
+    def _make_pose(pos: np.ndarray, quat: np.ndarray) -> PoseStamped:
+        msg = PoseStamped()
+        msg.pose.position.x = float(pos[0])
+        msg.pose.position.y = float(pos[1])
+        msg.pose.position.z = float(pos[2])
+        msg.pose.orientation.x = float(quat[0])
+        msg.pose.orientation.y = float(quat[1])
+        msg.pose.orientation.z = float(quat[2])
+        msg.pose.orientation.w = float(quat[3])
+        return msg
 
     @staticmethod
     def _make_pose(base_pose: PoseStamped, pos: np.ndarray, rot: R) -> PoseStamped:

@@ -103,7 +103,7 @@ class HandEyeCollector(Node):
         self.debug_image_pub = None
         if self.publish_debug_image:
             self.debug_image_pub = self.create_publisher(Image, self.debug_image_topic, 10)
-
+        self.tag_pose_pub = self.create_publisher(PoseStamped, '/tag_pose', 10)
         self.create_service(Trigger, 'capture_sample', self._capture_sample_cb)
         self.create_service(Trigger, 'save_samples', self._save_samples_cb)
 
@@ -193,6 +193,8 @@ class HandEyeCollector(Node):
             np.asarray(selected.pose_R, dtype=float),
             np.asarray(selected.pose_t, dtype=float).reshape(3),
         )
+        
+        self.tag_pose_pub.publish(matrix_to_pose_stamped(cam_t_tag, img_msg.header))
 
         self.latest_cam_t_tag = cam_t_tag
         self.latest_tag_id = int(selected.tag_id)
@@ -544,6 +546,18 @@ def pose_to_matrix(px: float, py: float, pz: float,
     rot = R.from_quat([float(qx), float(qy), float(qz), float(qw)]).as_matrix()
     return pt.transform_from(rot, [float(px), float(py), float(pz)])
 
+def matrix_to_pose_stamped(T, header):
+    msg = PoseStamped()
+    msg.header = header
+    msg.pose.position.x = float(T[0, 3])
+    msg.pose.position.y = float(T[1, 3])
+    msg.pose.position.z = float(T[2, 3])
+    q = R.from_matrix(T[:3, :3]).as_quat()
+    msg.pose.orientation.x = float(q[0])
+    msg.pose.orientation.y = float(q[1])
+    msg.pose.orientation.z = float(q[2])
+    msg.pose.orientation.w = float(q[3])
+    return msg
 
 def main() -> None:
     rclpy.init()
